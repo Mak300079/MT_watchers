@@ -2,26 +2,39 @@ import os
 import requests
 import time
 import json
-import requests
 import pandas as pd
-from datetime import datetime,UTC
+from datetime import datetime, UTC
 from pathlib import Path
 from dotenv import load_dotenv
+
+# ==== NEW: DB imports ====
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 # === CONFIG ===
 API_URL   = "https://api-v2.pendle.finance/core/v1/assets/all"
 PARAMS    = {"chainId": 1}  # Ethereum mainnet
-# Use your existing OneDrive folder
-BASE_DIR  = Path(r"C:/Users/MarcoTosi/OneDrive - Shikuma Capital/MT/Transfer/Personal/Crypto project")
+
+load_dotenv()
+BOT_TOKEN     = os.getenv("BOT_TOKEN")
+CHAT_ID       = os.getenv("CHAT_ID")
+DATABASE_URL  = os.getenv("DATABASE_URL")  # <-- required for DB
+
+# Local state (still useful for diffing + snapshots; safe to keep)
+BASE_DIR = Path(__file__).resolve().parent
 STATE_FP  = BASE_DIR / "pendle_assets_latest.json"       # canonical last snapshot
-LOG_FP    = BASE_DIR / "pendle_new_assets_log.csv"       # append-only log
+LOG_FP    = BASE_DIR / "pendle_new_assets_log.csv"       # append-only log (optional)
 SNAP_DIR  = BASE_DIR / "pendle_snapshots"                # dated snapshots
-POLL_SECS = 15 * 60  # 30 minutes between checks; adjust as desired
-load_dotenv(dotenv_path="C:/Users/MarcoTosi/OneDrive - Shikuma Capital/MT/Transfer/Personal/Crypto project/.env")
-BOT_TOKEN   = os.getenv("BOT_TOKEN")
-CHAT_ID     = os.getenv("CHAT_ID")
+
+POLL_SECS = 15 * 60  # 15 minutes between checks
 
 SNAP_DIR.mkdir(parents=True, exist_ok=True)
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ==== NEW: create a single engine reused across cycles ====
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set; please set it in .env or Render Env Vars")
+_engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 def notify(msg: str):
     if not (BOT_TOKEN and CHAT_ID):
@@ -73,6 +86,52 @@ def detect_new_assets(prev_assets, curr_assets):
     prev_set = {normalize_key(a) for a in prev_assets}
     return [a for a in curr_assets if normalize_key(a) not in prev_set]
 
+# ==== NEW: DB helpers ====
+UPSERT_SQL = text("""
+    INSERT INTO pendle_assets(address, name, symbol, chain_id)
+    VALUES (:address, :name, :symbol, :chain_id)
+    ON CONFLICT (address) DO UPDATE
+    SET name = EXCLUDED.name,
+        symbol = EXCLUDED.symbol,
+        chain_id = EXCLUDED.chain_id,
+        last_seen_ts = now()
+""")
+
+def upsert_asset_batch(assets: list[dict]):
+    """Upsert all current assets so last_seen_ts stays fresh."""
+    rows = []
+    for a in assets:
+        rows.append({
+            "address": (a.get("address") or "").lower(),
+            "name": a.get("name") or a.get("symbol") or "",
+            "symbol": a.get("symbol") or "",
+            "chain_id": a.get("chainId") or a.get("chain_id") or PARAMS["chainId"],
+        })
+    if not rows:
+        return
+    try:
+        with _engine.begin() as con:
+            con.execute(UPSERT_SQL, rows)
+    except SQLAlchemyError as e:
+        print("[ERR][DB] Upsert failed:", e)
+
+def append_log_csv(new_assets: list[dict]):
+    """Optional: append-only CSV of just the NEW assets discovered in this cycle."""
+    if not new_assets:
+        return
+    try:
+        df = pd.DataFrame([{
+            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
+            "address": (a.get("address") or "").lower(),
+            "name": a.get("name") or a.get("symbol") or "",
+            "symbol": a.get("symbol") or "",
+            "chain_id": a.get("chainId") or a.get("chain_id") or PARAMS["chainId"],
+        } for a in new_assets])
+        header = not LOG_FP.exists()
+        df.to_csv(LOG_FP, mode="a", header=header, index=False, encoding="utf-8")
+    except Exception as e:
+        print("[WARN] Could not append CSV log:", e)
+
 def one_cycle(cycle_idx: int):
     # 1) fetch current
     payload = fetch_assets()
@@ -85,20 +144,24 @@ def one_cycle(cycle_idx: int):
     # 3) diff
     new_assets = detect_new_assets(prev_assets, curr_assets)
 
-    # 4) report (optional)
+    # 4) DB persist (ALL current assets → keeps last_seen_ts fresh)
+    upsert_asset_batch(curr_assets)
+
+    # 5) notify/report
     ts = datetime.now(UTC).isoformat(timespec="seconds")
     if new_assets:
         asset_names  = [a.get("name") or a.get("symbol") or "?" for a in new_assets]
         msg = "Pendle watcher: " + str(len(new_assets)) + " new assets detected:\n" + "\n".join(asset_names)
         notify(msg)
+        append_log_csv(new_assets)
         print(f"[{ts}] Found {len(new_assets)} new assets.")
     else:
         print(f"[{ts}] No new assets.")
 
-    # 5) persist current as the new baseline → ensures next loop uses this as prev
+    # 6) persist current as the new baseline (for next diffs)
     save_state(payload)
 
-    # 6) optional: occasional snapshot (e.g., every 96 cycles ~1 day at 15-min cadence)
+    # 7) occasional snapshot
     if cycle_idx % 96 == 0:
         snap_fp = snapshot_payload(payload)
         print(f"[{ts}] Snapshot saved → {snap_fp}")

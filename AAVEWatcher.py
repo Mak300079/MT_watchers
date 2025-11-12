@@ -14,7 +14,7 @@ import traceback
 # -------------------------
 # Config & setup
 # -------------------------
-load_dotenv(dotenv_path="C:/Users/MarcoTosi/OneDrive - Shikuma Capital/MT/Transfer/Personal/Crypto project/.env")
+load_dotenv()
 ALCHEMY_API = os.getenv("ALCHEMY_API")
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
 CHAT_ID     = os.getenv("CHAT_ID")
@@ -28,7 +28,7 @@ CONFIGURATOR = Web3.to_checksum_address("0x64b761D848206f447Fe2dd461b0c635Ec39Eb
 # Event topic0 hashes
 TOPIC_SUPPLY_CAP_CHANGED = Web3.keccak(text="SupplyCapChanged(address,uint256,uint256)").hex()
 TOPIC_BORROW_CAP_CHANGED = Web3.keccak(text="BorrowCapChanged(address,uint256,uint256)").hex()
-TOPIC_DEBT_CEIL_CHANGED = Web3.keccak(text="DebtCeilingChanged(address,uint256,uint256)").hex()
+#TOPIC_DEBT_CEIL_CHANGED = Web3.keccak(text="DebtCeilingChanged(address,uint256,uint256)").hex()
 
 # Watcher parameters
 MAX_BLOCK_SPAN   = 10    # Respect Alchemy free plan window (<= 10 blocks)
@@ -126,8 +126,8 @@ def decode_cap_change_log(log) -> dict:
         event = "SupplyCapChanged"
     elif topic0 == TOPIC_BORROW_CAP_CHANGED:
         event = "BorrowCapChanged"
-    elif topic0 == TOPIC_DEBT_CEIL_CHANGED:
-        event = "DebtCeilingChanged"
+#    elif topic0 == TOPIC_DEBT_CEIL_CHANGED:
+#        event = "DebtCeilingChanged"
     else:
         event = "UnknownEvent"
 
@@ -178,7 +178,8 @@ def fetch_and_process(from_block: int, to_block: int) -> int:
         return 0
 
     # topics filter: OR on topic0 → pass as list in the first element
-    topics_filter = [[TOPIC_SUPPLY_CAP_CHANGED, TOPIC_BORROW_CAP_CHANGED,TOPIC_DEBT_CEIL_CHANGED]]
+    # topics_filter = [[TOPIC_SUPPLY_CAP_CHANGED, TOPIC_BORROW_CAP_CHANGED,TOPIC_DEBT_CEIL_CHANGED]]
+    topics_filter = [[TOPIC_SUPPLY_CAP_CHANGED, TOPIC_BORROW_CAP_CHANGED]]
 
     logs = w3.eth.get_logs({
         "address": CONFIGURATOR,
@@ -209,7 +210,7 @@ def main():
     print("CONFIGURATOR:", CONFIGURATOR)
     print("TOPIC_SUPPLY_CAP_CHANGED:", TOPIC_SUPPLY_CAP_CHANGED)
     print("TOPIC_BORROW_CAP_CHANGED:", TOPIC_BORROW_CAP_CHANGED)
-    print("TOPIC_DEBT_CEIL_CHANGED",TOPIC_DEBT_CEIL_CHANGED)
+    #print("TOPIC_DEBT_CEIL_CHANGED",TOPIC_DEBT_CEIL_CHANGED)
 
     head = w3.eth.block_number
     if START_BLOCK_ENV:

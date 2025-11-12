@@ -1,0 +1,20 @@
+# Ignore environment and secrets
+.env
+*.env
+
+# Ignore Python cache & temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.tmp
+*.log
+
+# Ignore local data snapshots or state
+*.json
+*.csv
+pendle_snapshots/
+
+# Ignore OS-specific junk
+.DS_Store
+Thumbs.db
+env
