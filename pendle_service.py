@@ -1,6 +1,6 @@
 import threading
 from fastapi import FastAPI
-from PandleAssetsWatcher import run_forever  # use the exact filename
+from PendleAssetsWatcher import run_forever  # use the exact filename
 
 app = FastAPI(title="Pendle Watcher Service")
 
