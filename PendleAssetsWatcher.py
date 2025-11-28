@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 # ==== NEW: DB imports ====
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+import logging
 
 # === CONFIG ===
 API_URL   = "https://api-v2.pendle.finance/core/v1/assets/all"
@@ -22,23 +23,27 @@ DATABASE_URL  = os.getenv("DATABASE_URL")  # <-- required for DB
 
 # Local state (still useful for diffing + snapshots; safe to keep)
 BASE_DIR = Path(__file__).resolve().parent
-STATE_FP  = BASE_DIR / "pendle_assets_latest.json"       # canonical last snapshot
-LOG_FP    = BASE_DIR / "pendle_new_assets_log.csv"       # append-only log (optional)
-SNAP_DIR  = BASE_DIR / "pendle_snapshots"                # dated snapshots
+STATE_FP = BASE_DIR / "pendle_assets_latest.json"   # canonical last snapshot
+LOG_FP   = BASE_DIR / "pendle_new_assets_log.csv"   # append-only log (optional)
+SNAP_DIR = BASE_DIR / "pendle_snapshots"            # dated snapshots
 
 POLL_SECS = 15 * 60  # 15 minutes between checks
 
 SNAP_DIR.mkdir(parents=True, exist_ok=True)
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ==== NEW: create a single engine reused across cycles ====
+# Logging
+log = logging.getLogger("pendle_watcher")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+
+# ==== DB engine reused across cycles ====
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set; please set it in .env or Render Env Vars")
 _engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 def notify(msg: str):
     if not (BOT_TOKEN and CHAT_ID):
-        print("[INFO] " + msg)
+        log.info(msg)
         return
     try:
         requests.post(
@@ -47,7 +52,7 @@ def notify(msg: str):
             timeout=10,
         )
     except Exception as e:
-        print("[ERR][TELEGRAM]", e)
+        log.warning("[ERR][TELEGRAM] %s", e)
 
 def fetch_assets():
     r = requests.get(API_URL, params=PARAMS, timeout=30)
@@ -86,7 +91,7 @@ def detect_new_assets(prev_assets, curr_assets):
     prev_set = {normalize_key(a) for a in prev_assets}
     return [a for a in curr_assets if normalize_key(a) not in prev_set]
 
-# ==== NEW: DB helpers ====
+# ==== DB helpers ====
 UPSERT_SQL = text("""
     INSERT INTO pendle_assets(address, name, symbol, chain_id)
     VALUES (:address, :name, :symbol, :chain_id)
@@ -113,7 +118,7 @@ def upsert_asset_batch(assets: list[dict]):
         with _engine.begin() as con:
             con.execute(UPSERT_SQL, rows)
     except SQLAlchemyError as e:
-        print("[ERR][DB] Upsert failed:", e)
+        log.error("[ERR][DB] Upsert failed: %s", e)
 
 def append_log_csv(new_assets: list[dict]):
     """Optional: append-only CSV of just the NEW assets discovered in this cycle."""
@@ -130,7 +135,7 @@ def append_log_csv(new_assets: list[dict]):
         header = not LOG_FP.exists()
         df.to_csv(LOG_FP, mode="a", header=header, index=False, encoding="utf-8")
     except Exception as e:
-        print("[WARN] Could not append CSV log:", e)
+        log.warning("[WARN] Could not append CSV log: %s", e)
 
 def one_cycle(cycle_idx: int):
     # 1) fetch current
@@ -154,9 +159,9 @@ def one_cycle(cycle_idx: int):
         msg = "Pendle watcher: " + str(len(new_assets)) + " new assets detected:\n" + "\n".join(asset_names)
         notify(msg)
         append_log_csv(new_assets)
-        print(f"[{ts}] Found {len(new_assets)} new assets.")
+        log.info("[%s] Found %s new assets.", ts, len(new_assets))
     else:
-        print(f"[{ts}] No new assets.")
+        log.info("[%s] No new assets.", ts)
 
     # 6) persist current as the new baseline (for next diffs)
     save_state(payload)
@@ -164,24 +169,51 @@ def one_cycle(cycle_idx: int):
     # 7) occasional snapshot
     if cycle_idx % 96 == 0:
         snap_fp = snapshot_payload(payload)
-        print(f"[{ts}] Snapshot saved → {snap_fp}")
+        log.info("[%s] Snapshot saved → %s", ts, snap_fp)
 
-def main():
-    print("Starting Pendle asset watcher… (Ctrl+C to stop)")
+# ---- stop-aware sleep helper ----
+def stop_aware_sleep(stop_event, secs: int) -> bool:
+    """Sleep up to secs, but exit early if stop_event is set. Returns True if stopped."""
+    for _ in range(secs):
+        if stop_event.is_set():
+            return True
+        time.sleep(1)
+    return False
+
+# ---- exported loop for Render ----
+def run_forever(stop_event):
+    """Long-running loop for Render Web Service (background thread)."""
+    log.info("Starting Pendle asset watcher…")
+
+    # DB startup sanity check
+    try:
+        with _engine.connect() as con:
+            con.execute(text("SELECT 1"))
+        log.info("DB connected.")
+    except SQLAlchemyError as e:
+        log.error("DB connection failed at startup: %s", e)
+
     i = 0
-    while True:
+    while not stop_event.is_set():
         try:
             one_cycle(i)
         except requests.HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
-            print(f"[WARN] HTTP error {status}: {e}. Backing off 5 minutes.")
-            time.sleep(5 * 60)
+            log.warning("[WARN] HTTP error %s: %s. Backing off 5 minutes.", status, e)
+            if stop_aware_sleep(stop_event, 5 * 60):  # 5 minutes
+                break
         except Exception as e:
-            print(f"[ERROR] {e}. Backing off 5 minutes.")
-            time.sleep(5 * 60)
+            log.error("[ERROR] %s. Backing off 5 minutes.", e, exc_info=True)
+            if stop_aware_sleep(stop_event, 5 * 60):
+                break
         finally:
             i += 1
-            time.sleep(POLL_SECS)
+            if stop_aware_sleep(stop_event, POLL_SECS):
+                break
 
+    log.info("Pendle watcher stopping gracefully.")
+
+# ---- local dev entrypoint ----
 if __name__ == "__main__":
-    main()
+    from threading import Event
+    run_forever(Event())

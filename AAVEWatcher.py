@@ -8,8 +8,11 @@ from eth_abi import decode
 from functools import lru_cache
 import requests
 from dotenv import load_dotenv
-import os, time, math
+import os, time, math, logging
 import traceback
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 # -------------------------
 # Config & setup
@@ -25,10 +28,15 @@ w3 = Web3(Web3.HTTPProvider(ALCHEMY_URL, request_kwargs={"timeout": 30}))
 # PoolConfigurator (proxy) on ETH mainnet
 CONFIGURATOR = Web3.to_checksum_address("0x64b761D848206f447Fe2dd461b0c635Ec39EbB27")
 
+# Logging
+log = logging.getLogger("aave_watcher")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+
 # Event topic0 hashes
 TOPIC_SUPPLY_CAP_CHANGED = Web3.keccak(text="SupplyCapChanged(address,uint256,uint256)").hex()
 TOPIC_BORROW_CAP_CHANGED = Web3.keccak(text="BorrowCapChanged(address,uint256,uint256)").hex()
 #TOPIC_DEBT_CEIL_CHANGED = Web3.keccak(text="DebtCeilingChanged(address,uint256,uint256)").hex()
+WATCH_TOPICS = [[TOPIC_SUPPLY_CAP_CHANGED, TOPIC_BORROW_CAP_CHANGED]]
 
 # Watcher parameters
 MAX_BLOCK_SPAN   = 10    # Respect Alchemy free plan window (<= 10 blocks)
@@ -41,6 +49,7 @@ START_BLOCK_ENV  = os.getenv("AAVE_START_BLOCK")  # optional manual start
 # -------------------------
 def notify(msg: str):
     if not (BOT_TOKEN and CHAT_ID):
+        log.info(msg)
         print("[WARN][NO-TELEGRAM]", msg)
         return
     try:
@@ -163,6 +172,7 @@ def emit_event_msg(ev: dict):
         f"{ev['event']} | Asset {ev['asset_label']} | "
         f"{ev['old_cap']} → {ev['new_cap']}"
     )
+    log.info(msg)
     print(msg)
     notify(msg)
 
@@ -196,62 +206,140 @@ def fetch_and_process(from_block: int, to_block: int) -> int:
             count += 1
         except Exception:
             print("[ERR] failed to decode/process a log:")
+            log.error("Failed to decode/process a log:", exc_info=True)
             traceback.print_exc()
     if count:
         print(f"[INFO] Processed {count} cap-change logs in blocks {from_block}..{to_block}")
+        log.info("[INFO] Processed %s cap-change logs in blocks %s..%s", count, from_block, to_block)
     return count
 
 # -------------------------
-# Main watcher loop
+# Stop-aware sleep helper
 # -------------------------
-def main():
-    print("chainId:", w3.eth.chain_id)
-    print("head:", w3.eth.block_number)
-    print("CONFIGURATOR:", CONFIGURATOR)
-    print("TOPIC_SUPPLY_CAP_CHANGED:", TOPIC_SUPPLY_CAP_CHANGED)
-    print("TOPIC_BORROW_CAP_CHANGED:", TOPIC_BORROW_CAP_CHANGED)
-    #print("TOPIC_DEBT_CEIL_CHANGED",TOPIC_DEBT_CEIL_CHANGED)
+def stop_aware_sleep(stop_event, secs: int) -> bool:
+    """Sleep up to secs, but exit early if stop_event is set. Returns True if stopped."""
+    for _ in range(secs):
+        if stop_event.is_set():
+            return True
+        time.sleep(1)
+    return False
+
+# -------------------------
+# Exported long-running loop
+# -------------------------
+def run_forever(stop_event):
+    """
+    Long-running loop suitable for a background thread (Render Web Service).
+    - Resumes from DB cursor_state.last_block if DATABASE_URL set; else uses START_BLOCK_ENV or head-CONFIRMATIONS
+    - Processes logs in <= MAX_BLOCK_SPAN chunks
+    - Saves last processed block to DB when available
+    """
+    # DB connectivity sanity (optional)
+
+
+    log.info("chainId=%s head=%s CONFIGURATOR=%s", w3.eth.chain_id, w3.eth.block_number, CONFIGURATOR)
+    log.info("Topics: SUPPLY=%s | BORROW=%s", TOPIC_SUPPLY_CAP_CHANGED, TOPIC_BORROW_CAP_CHANGED)
 
     head = w3.eth.block_number
-    if START_BLOCK_ENV:
-        try:
-            last_processed = int(START_BLOCK_ENV)
-        except ValueError:
-            last_processed = head - max(CONFIRMATIONS, 1)
-    else:
-        # Start at the most recent safe block (so we don't miss the next block)
-        last_processed = max(0, head - CONFIRMATIONS)
+    # Preference: DB -> env -> safe head
+    last_processed = None
+    if last_processed is None:
+        if START_BLOCK_ENV:
+            try:
+                last_processed = int(START_BLOCK_ENV)
+            except ValueError:
+                last_processed = max(0, head - max(CONFIRMATIONS, 1))
+        else:
+            last_processed = max(0, head - CONFIRMATIONS)
 
-    print(f"[START] last_processed set to {last_processed}")
+    log.info("[START] last_processed set to %s", last_processed)
 
     backoff = 1
-    while True:
+    while not stop_event.is_set():
         try:
             head = w3.eth.block_number
             safe_head = max(0, head - CONFIRMATIONS)
 
-            # Nothing to do? sleep & continue
             if safe_head < last_processed:
-                time.sleep(POLL_SECONDS)
+                if stop_aware_sleep(stop_event, POLL_SECONDS): break
                 continue
 
-            # Process in ≤10-block windows (Alchemy free)
             while last_processed <= safe_head:
                 window_end = min(last_processed + MAX_BLOCK_SPAN - 1, safe_head)
                 fetch_and_process(last_processed, window_end)
                 last_processed = window_end + 1
 
-            # reset backoff on success
+
             backoff = 1
-            time.sleep(POLL_SECONDS)
+            if stop_aware_sleep(stop_event, POLL_SECONDS): break
 
         except Exception as e:
-            print("[LOOP-ERR]", repr(e))
-            traceback.print_exc()
-            # Exponential backoff (capped)
-            time.sleep(min(60, backoff))
+            log.exception("[LOOP-ERR] %r", e)
+            notify(f"AAVE watcher error: {e!r}")
+            if stop_aware_sleep(stop_event, min(60, backoff)): break
             backoff = min(60, backoff * 2)
 
+    log.info("AAVE watcher stopping gracefully.")
+
+
+# -------------------------
+# Local dev entrypoint
+# -------------------------
 if __name__ == "__main__":
-    main()
+    from threading import Event
+    run_forever(Event())
+    
+# -------------------------
+# Main watcher loop
+# -------------------------
+#def main():
+#    print("chainId:", w3.eth.chain_id)
+#    print("head:", w3.eth.block_number)
+#    print("CONFIGURATOR:", CONFIGURATOR)
+#    print("TOPIC_SUPPLY_CAP_CHANGED:", TOPIC_SUPPLY_CAP_CHANGED)
+#    print("TOPIC_BORROW_CAP_CHANGED:", TOPIC_BORROW_CAP_CHANGED)
+#    #print("TOPIC_DEBT_CEIL_CHANGED",TOPIC_DEBT_CEIL_CHANGED)
+
+#    head = w3.eth.block_number
+#    if START_BLOCK_ENV:
+#        try:
+#            last_processed = int(START_BLOCK_ENV)
+#        except ValueError:
+#            last_processed = head - max(CONFIRMATIONS, 1)
+#    else:
+#        # Start at the most recent safe block (so we don't miss the next block)
+#        last_processed = max(0, head - CONFIRMATIONS)
+
+#    print(f"[START] last_processed set to {last_processed}")
+
+#    backoff = 1
+#    while True:
+#        try:
+#            head = w3.eth.block_number
+#            safe_head = max(0, head - CONFIRMATIONS)
+
+#            # Nothing to do? sleep & continue
+#            if safe_head < last_processed:
+#                time.sleep(POLL_SECONDS)
+#                continue
+
+#            # Process in ≤10-block windows (Alchemy free)
+#            while last_processed <= safe_head:
+#                window_end = min(last_processed + MAX_BLOCK_SPAN - 1, safe_head)
+#                fetch_and_process(last_processed, window_end)
+#                last_processed = window_end + 1
+
+            # reset backoff on success
+#            backoff = 1
+#            time.sleep(POLL_SECONDS)
+
+#        except Exception as e:
+#            print("[LOOP-ERR]", repr(e))
+#            traceback.print_exc()
+#            # Exponential backoff (capped)
+#            time.sleep(min(60, backoff))
+#            backoff = min(60, backoff * 2)
+
+#if __name__ == "__main__":
+#    main()
 

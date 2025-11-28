@@ -5,3 +5,6 @@ psycopg[binary]
 python-dotenv
 web3
 eth-abi
+fastapi
+uvicorn[standard]
+
