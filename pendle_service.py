@@ -1,6 +1,7 @@
 import threading
 from fastapi import FastAPI
-from PendleAssetsWatcher import run_forever  # use the exact filename
+from PendleAssetsWatcher import run_forever
+from PendleAssetsWatcher import notify 
 
 app = FastAPI(title="Pendle Watcher Service")
 
@@ -10,6 +11,11 @@ _thread = None
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/test-notify")
+def test_notify():
+    notify("Test message from Render")
+    return {"sent" : True}
 
 @app.on_event("startup")
 def on_start():
